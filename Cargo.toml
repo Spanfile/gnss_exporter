@@ -1,0 +1,14 @@
+[package]
+name = "gnss_exporter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.71"
+axum = { version = "0.6.18", features = ["headers"] }
+envy = "0.4.2"
+prometheus = "0.13.3"
+reqwest = { version = "0.11.17", default-features = false }
+serde = { version = "1.0.162", features = ["derive"] }
+serde-xml-rs = "0.6.0"
+tokio = { version = "1.28.0", features = ["net", "macros", "rt-multi-thread"] }

@@ -5,7 +5,7 @@ use axum::{
     routing::get,
     Router, TypedHeader,
 };
-use prometheus::{Encoder, Gauge, IntGauge, Opts, TextEncoder};
+use prometheus::{Encoder, Gauge, IntGauge, IntGaugeVec, Opts, TextEncoder};
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -19,17 +19,11 @@ struct MetricState {
     client: Arc<Client>,
 
     ant: Arc<IntGauge>,
-    sv: Arc<IntGauge>,
-
-    gps_used: Arc<IntGauge>,
-    gps_seen: Arc<IntGauge>,
-    bd_used: Arc<IntGauge>,
-    bd_seen: Arc<IntGauge>,
-    gl_used: Arc<IntGauge>,
-    gl_seen: Arc<IntGauge>,
+    svs_used: Arc<IntGaugeVec>,
+    svs_seen: Arc<IntGaugeVec>,
 
     lat: Arc<Gauge>,
-    long: Arc<Gauge>,
+    lon: Arc<Gauge>,
     alt: Arc<Gauge>,
 }
 
@@ -37,7 +31,7 @@ struct MetricState {
 struct Gnss {
     ant: String,
     // r#const: String,
-    svused: i64,
+    // svused: i64,
     gpsinfo: String,
     bdinfo: String,
     glinfo: String,
@@ -57,43 +51,27 @@ async fn main() -> anyhow::Result<()> {
     println!("{config:?}");
 
     let ant = IntGauge::with_opts(Opts::new("gnss_ant", "Antenna status (0 = OPEN, 1 = OK)"))?;
-    let sv = IntGauge::with_opts(Opts::new("gnss_sv", "Satellites used in total"))?;
-
-    let gps_used = IntGauge::with_opts(Opts::new("gnss_gps_used", "GPS satellites used"))?;
-    let gps_seen = IntGauge::with_opts(Opts::new("gnss_gps_seen", "GPS satellites seen"))?;
-    let bd_used = IntGauge::with_opts(Opts::new("gnss_bd_used", "BeiDou satellites used"))?;
-    let bd_seen = IntGauge::with_opts(Opts::new("gnss_bd_seen", "BeiDou satellites seen"))?;
-    let gl_used = IntGauge::with_opts(Opts::new("gnss_gl_used", "GLONASS satellites used"))?;
-    let gl_seen = IntGauge::with_opts(Opts::new("gnss_gl_seen", "GLONASS satellites seen"))?;
+    let svs_used = IntGaugeVec::new(Opts::new("gnss_svs_used", "Satellites used"), &["constellation"])?;
+    let svs_seen = IntGaugeVec::new(Opts::new("gnss_svs_seen", "Satellites seen"), &["constellation"])?;
 
     let lat = Gauge::with_opts(Opts::new("gnss_lat", "Latitude in decimal degrees"))?;
-    let long = Gauge::with_opts(Opts::new("gnss_long", "Longitude in decimal degrees"))?;
+    let lon = Gauge::with_opts(Opts::new("gnss_lon", "Longitude in decimal degrees"))?;
     let alt = Gauge::with_opts(Opts::new("gnss_alt", "Altitude in meters"))?;
 
     prometheus::register(Box::new(ant.clone()))?;
-    prometheus::register(Box::new(sv.clone()))?;
-    prometheus::register(Box::new(gps_used.clone()))?;
-    prometheus::register(Box::new(gps_seen.clone()))?;
-    prometheus::register(Box::new(bd_used.clone()))?;
-    prometheus::register(Box::new(bd_seen.clone()))?;
-    prometheus::register(Box::new(gl_used.clone()))?;
-    prometheus::register(Box::new(gl_seen.clone()))?;
+    prometheus::register(Box::new(svs_seen.clone()))?;
+    prometheus::register(Box::new(svs_used.clone()))?;
     prometheus::register(Box::new(lat.clone()))?;
-    prometheus::register(Box::new(long.clone()))?;
+    prometheus::register(Box::new(lon.clone()))?;
     prometheus::register(Box::new(alt.clone()))?;
 
     let metric_state = MetricState {
         client: Arc::new(Client::builder().http1_title_case_headers().build()?),
         ant: Arc::new(ant),
-        sv: Arc::new(sv),
-        gps_used: Arc::new(gps_used),
-        gps_seen: Arc::new(gps_seen),
-        bd_used: Arc::new(bd_used),
-        bd_seen: Arc::new(bd_seen),
-        gl_used: Arc::new(gl_used),
-        gl_seen: Arc::new(gl_seen),
+        svs_used: Arc::new(svs_used),
+        svs_seen: Arc::new(svs_seen),
         lat: Arc::new(lat),
-        long: Arc::new(long),
+        lon: Arc::new(lon),
         alt: Arc::new(alt),
     };
 
@@ -123,7 +101,9 @@ async fn handler(
     }
     .expect("failed to read GNSS XML");
 
-    update_metrics(&metric, gnss);
+    if let Err(e) = update_metrics(&metric, gnss) {
+        println!("failed to update metrics: {e}");
+    }
 
     let metrics = prometheus::gather();
     println!("{metrics:?}");
@@ -155,39 +135,37 @@ async fn read_gnss(target: &str, auth: Option<(&str, &str)>, client: &Client) ->
     Ok(gnss)
 }
 
-fn update_metrics(metric: &MetricState, gnss: Gnss) {
+fn update_metrics(metric: &MetricState, gnss: Gnss) -> anyhow::Result<()> {
     metric.ant.set(match gnss.ant.as_str() {
         "OPEN" => 0,
         "OK" => 1,
         _ => 2,
     });
 
-    metric.sv.set(gnss.svused);
+    let (gps_used, gps_seen) = parse_used_seen(&gnss.gpsinfo)?;
+    let (bd_used, bd_seen) = parse_used_seen(&gnss.bdinfo)?;
+    let (gl_used, gl_seen) = parse_used_seen(&gnss.glinfo)?;
 
-    if let Ok((gps_used, gps_seen)) = parse_used_seen(&gnss.gpsinfo) {
-        metric.gps_used.set(gps_used);
-        metric.gps_seen.set(gps_seen);
-    }
+    metric.svs_used.with_label_values(&["GPS"]).set(gps_used);
+    metric.svs_used.with_label_values(&["BeiDou"]).set(bd_used);
+    metric.svs_used.with_label_values(&["GLONASS"]).set(gl_used);
 
-    if let Ok((bd_used, bd_seen)) = parse_used_seen(&gnss.bdinfo) {
-        metric.bd_used.set(bd_used);
-        metric.bd_seen.set(bd_seen);
-    }
+    metric.svs_seen.with_label_values(&["GPS"]).set(gps_seen);
+    metric.svs_seen.with_label_values(&["BeiDou"]).set(bd_seen);
+    metric.svs_seen.with_label_values(&["GLONASS"]).set(gl_seen);
 
-    if let Ok((gl_used, gl_seen)) = parse_used_seen(&gnss.glinfo) {
-        metric.gl_used.set(gl_used);
-        metric.gl_seen.set(gl_seen);
-    }
+    let lat = parse_lat_long(&gnss.lat)?;
+    let lon = parse_lat_long(&gnss.long)?;
 
-    if let Ok((lat, long)) = parse_lat_long(&gnss.lat).and_then(|lat| Ok((lat, parse_lat_long(&gnss.long)?))) {
-        metric.lat.set(lat);
-        metric.long.set(long);
-    }
+    metric.lat.set(lat);
+    metric.lon.set(lon);
 
     let alt = gnss.alt.trim_end_matches(" m");
     if let Ok(alt) = alt.parse() {
         metric.alt.set(alt);
     }
+
+    Ok(())
 }
 
 fn parse_used_seen(v: &str) -> anyhow::Result<(i64, i64)> {
@@ -206,13 +184,12 @@ fn parse_lat_long(v: &str) -> anyhow::Result<f64> {
         _ => return Err(anyhow::anyhow!("malformed lat/long value")),
     };
 
-    let (dec_min, sec) = val.split_once('.').ok_or(anyhow::anyhow!("malformed lat/long value"))?;
+    let separator = val.find('.').ok_or(anyhow::anyhow!("malformed lat/long value"))?;
 
-    let (dec, min) = dec_min.split_at(dec_min.len() - 2);
-    let dec: f64 = dec.parse()?;
-    let min: f64 = min.parse()?;
+    let (degrees, minutes) = val.split_at(separator - 2);
+    let degrees: f64 = degrees.parse()?;
+    let minutes: f64 = minutes.parse()?;
 
-    let sec = sec.parse::<f64>()? / 1000.0;
-
-    Ok(sign * (dec + min / 60.0 + sec / 3600.0))
+    let decimal_degrees = minutes / 60.0;
+    Ok(sign * (degrees + decimal_degrees))
 }
